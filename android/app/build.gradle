@@ -21,10 +21,13 @@ android {
 
     defaultConfig {
         applicationId 'com.xiaomayi.tire'
-        minSdk 21
+        // minSdk 24：DCloud 5.33 SDK 的 uni-AD 组件（Funlink_adapter_uniad 等 AAR）要求 minSdk >= 24，
+        // 21 会在清单合并阶段失败；Android 7.0 以下设备占比已趋近于零
+        minSdk 24
         targetSdk 35
         versionCode appVersionCode
         versionName appVersionName
+        multiDexEnabled true
         ndk {
             abiFilters 'armeabi-v7a', 'arm64-v8a'
         }
@@ -56,6 +59,28 @@ android {
         }
     }
 
+    // DCloud 官方离线打包要求（HBuilder-Integrate-AS 示例工程）：
+    // 默认 ignoreAssetsPattern 含 <dir>_*，会忽略 appid 目录 assets/apps/__UNI__TIRE001/，
+    // 导致前端资源不进 APK；ignoreAssetsPattern 必须去掉该段。
+    aaptOptions {
+        additionalParameters '--auto-add-overlay'
+    }
+    // ignoreAssetsPattern 必须用 AGP 8 的 androidResources 新 DSL 声明（aaptOptions 旧 DSL 在
+    // AGP 8.7 下不生效，默认 pattern 的 <dir>_* 会把 assets/apps/__UNI__TIRE001（'_' 开头目录）
+    // 在资产合并阶段整体丢弃，产出空壳白屏 APK）；
+    // 这里 pattern 全否定 = 不忽略任何文件（.svn/.git 等本就不在源码树）
+    androidResources {
+        ignoreAssetsPattern '!.svn:!.git:!CVS:!thumbs.db:!picasa.ini:!*.scc:!~*.*'
+    }
+
+    // uniapp-v8-release.aar 清单声明 android:extractNativeLibs="true"（原生加载器依赖解压后的 .so），
+    // 应用侧未声明时 AGP 8 清单合并报错；useLegacyPackaging 令应用清单与其对齐
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
@@ -67,4 +92,15 @@ dependencies {
     // 从 https://nativesupport.dcloud.net.cn/AppDocs/download/android 下载后，
     // 将 aar 放入 app/libs/，由下行引入；前端资源放入 app/src/main/assets/apps/<APPID>/www
     implementation fileTree(dir: 'libs', include: ['*.aar', '*.jar'])
+    // DCloud 5+ 运行时依赖的第三方库（版本与官方示例工程一致，见 HBuilder-Integrate-AS/simpleDemo）
+    implementation 'androidx.appcompat:appcompat:1.1.0'
+    implementation 'androidx.localbroadcastmanager:localbroadcastmanager:1.0.0'
+    implementation 'androidx.core:core:1.1.0'
+    implementation 'androidx.fragment:fragment:1.1.0'
+    implementation 'androidx.recyclerview:recyclerview:1.1.0'
+    implementation 'com.facebook.fresco:fresco:2.5.0'
+    implementation 'com.facebook.fresco:animated-gif:2.5.0'
+    implementation 'com.github.bumptech.glide:glide:4.9.0'
+    implementation 'com.alibaba:fastjson:1.2.83'
+    implementation 'androidx.webkit:webkit:1.5.0'
 }

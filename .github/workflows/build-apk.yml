@@ -44,8 +44,8 @@ on:
         description: 'DCloud 离线 SDK zip 直链；留空则用本仓 sdk tag 的 release 附件 dcloud-sdk.zip'
         required: false
       gradle_version:
-        description: 'Gradle 版本（以 DCloud SDK 文档要求为准，须满足 AGP 8.6.1 最低要求 8.7）'
-        default: '8.7'
+        description: 'Gradle 版本（以 DCloud SDK 文档要求为准，须满足 AGP 8.7.3 最低要求 8.9）'
+        default: '8.9'
 
 permissions:
   contents: read
@@ -109,7 +109,7 @@ jobs:
           ls -la "$www"
 
       - name: 安装 JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -134,15 +134,60 @@ jobs:
           fi
           mkdir -p /tmp/dcloud-sdk-unzipped
           unzip -q /tmp/dcloud-sdk.zip -d /tmp/dcloud-sdk-unzipped
-          # SDK zip 内目录层级不定，定位包含 libs/ 的目录
-          libs_dir=$(find /tmp/dcloud-sdk-unzipped -type d -name libs -print -quit)
+          # SDK zip 内目录层级不定，且含多个示例工程的 libs/（UniPlugin-Hello-AS 等），优先取 */SDK/ 下的 libs
+          libs_dir=$(find /tmp/dcloud-sdk-unzipped -type d -name libs -path '*/SDK/*' -print -quit)
+          [ -z "$libs_dir" ] && libs_dir=$(find /tmp/dcloud-sdk-unzipped -type d -name libs -print -quit)
           if [ -z "$libs_dir" ]; then
             echo "::error::SDK zip 内未找到 libs/ 目录，请确认地址指向 DCloud App 离线打包 SDK" >&2
             exit 1
           fi
           sdk_dir=$(dirname "$libs_dir")
           mkdir -p android/app/libs
-          find "$libs_dir" \( -name '*.aar' -o -name '*.jar' \) -exec cp -t android/app/libs/ {} +
+          # 按需注入（白名单）：SDK/libs 是含广告/地图/支付/推送/人脸等模块的备选库全集，
+          # 全量拷贝会产生 AAR 间冲突（kssdk-allad-content 与 ks_adsdk-ad 同名 Activity 与重复类、
+          # msa_mdid 与 oaid_sdk 重复命名空间、广告 SDK 要求 usesCleartextTraffic=true 等），
+          # dex 阶段还会撞 Duplicate class，且 APK 体积与上架合规（广告 SDK 收集设备标识）都有问题。
+          # 本应用仅用到：基础运行时 + uni API 模块（storage/prompt/network/location/系统信息/拍照上传/应用内更新）；
+          # 新页面用到其他原生能力（地图、推送、分享等）时，把对应 aar 加进下面的清单。
+          # 注意：YAML 块标量内所有行必须保持缩进，续行无缩进会破坏 workflow 解析；
+          # 读取时用 tr 去除行内空白
+          INCLUDE_AARS='
+            lib.5plus.base-release.aar
+            uniapp-v8-release.aar
+            breakpad-build-release.aar
+            debug-server-release.aar
+            utsplugin-release.aar
+            android-gif-drawable-1.2.29.aar
+            install-apk-release.aar
+            oaid_sdk_1.0.25.aar
+            uni-chooseMedia-release.aar
+            uni-createRequestPermissionListener-release.aar
+            uni-exit-release.aar
+            uni-getAccessibilityInfo-release.aar
+            uni-getAppAuthorizeSetting-release.aar
+            uni-getAppBaseInfo-release.aar
+            uni-getDeviceInfo-release.aar
+            uni-getLocation-tencent-uni1-release.aar
+            uni-getNetworkType-release.aar
+            uni-getSystemInfo-release.aar
+            uni-getSystemSetting-release.aar
+            uni-installApk-release.aar
+            uni-network-release.aar
+            uni-openAppAuthorizeSetting-release.aar
+            uni-prompt-release.aar
+            uni-storage-release.aar'
+          missing=0
+          while IFS= read -r aar; do
+            aar=$(printf '%s' "$aar" | tr -d '[:space:]')
+            [ -z "$aar" ] && continue
+            if [ -e "$libs_dir/$aar" ]; then
+              cp "$libs_dir/$aar" android/app/libs/
+            else
+              echo "::error::SDK 内未找到白名单构件 $aar（SDK 版本变更？请同步更新 INCLUDE_AARS）" >&2
+              missing=1
+            fi
+          done <<< "$INCLUDE_AARS"
+          [ "$missing" -eq 1 ] && exit 1
           # SDK 的 assets/data 与 res 用 no-clobber 合并，保留本仓已定制的 dcloud_control.xml / themes.xml
           if [ -d "$sdk_dir/assets/data" ]; then
             cp -rn "$sdk_dir"/assets/data/. android/app/src/main/assets/data/
@@ -152,20 +197,36 @@ jobs:
           fi
           echo '已注入的 SDK 构件：'
           ls -l android/app/libs/
+          # 硬校验：DCloud 运行时核心构件必须存在，防止上游 zip 残缺时产出空壳 APK
+          if [ ! -e android/app/libs/lib.5plus.base-release.aar ]; then
+            echo "::error::SDK 注入校验失败：android/app/libs/ 缺少 lib.5plus.base-release.aar，下载的 SDK zip 可能不完整" >&2
+            exit 1
+          fi
 
       - name: 生成占位启动图标（仓库未收录二进制图标时）
         run: |
           set -euo pipefail
           res=android/app/src/main/res
           if [ ! -e "$res/mipmap-xxxhdpi/ic_launcher.png" ]; then
-            # android/README.md：仓库不收录二进制图标；构建期生成纯色占位，上架前替换品牌图标
-            if command -v convert >/dev/null 2>&1; then im() { convert "$@"; }; else im() { magick "$@"; }; fi
-            for spec in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
-              density=${spec%:*}; size=${spec#*:}
-              mkdir -p "$res/mipmap-$density"
-              im -size "${size}x${size}" xc:'#3478F6' "$res/mipmap-$density/ic_launcher.png"
-            done
-            echo '已生成占位 ic_launcher（上架前替换品牌图标，见 android/README.md）'
+          # android/README.md：仓库不收录二进制图标；构建期生成纯色占位，上架前替换品牌图标。
+          # runner 无 ImageMagick，用 python3 标准库直接写最小 PNG（8-bit 真彩纯色 #3478F6）。
+          # 注意：heredoc 终止符 PY 必须顶格，python 代码与外层脚本同级缩进。
+          python3 - "$res" <<'PY'
+          import struct, sys, zlib
+          from pathlib import Path
+          res = Path(sys.argv[1])
+          def chunk(tag, data):
+              return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
+          def png(size):
+              ihdr = struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)
+              row = b'\x00' + b'\x34\x78\xf6' * size
+              return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(row * size, 9)) + chunk(b'IEND', b'')
+          for density, px in {'mdpi':48, 'hdpi':72, 'xhdpi':96, 'xxhdpi':144, 'xxxhdpi':192}.items():
+              d = res / f'mipmap-{density}'
+              d.mkdir(parents=True, exist_ok=True)
+              (d / 'ic_launcher.png').write_bytes(png(px))
+          print('已生成占位 ic_launcher（上架前替换品牌图标，见 android/README.md）')
+          PY
           fi
 
       - name: 还原签名材料（来自 Secrets）
@@ -204,6 +265,31 @@ jobs:
           set -euo pipefail
           # debug：AGP 自动用 ~/.android/debug.keystore 签名，无需任何 Secrets
           gradle "assemble${BUILD_TYPE^}" --no-daemon --stacktrace
+
+      - name: 产物完整性校验（防空壳 APK）
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          set -euo pipefail
+          apks=(android/app/build/outputs/apk/$BUILD_TYPE/*.apk)
+          apk=${apks[0]}
+          listing=$(unzip -l "$apk")
+          # 取证输出：assets 是否进包、在哪一环丢弃，失败时可直接从日志定位
+          echo '== APK 内容（assets 相关行）:'
+          grep -E 'assets/|AndroidManifest|\.dex' <<<"$listing" | head -40 || true
+          # uni-app 前端资源与 DCloud 运行时资源缺一不可，否则装上必白屏。
+          # 注意不能用 `echo "$listing" | grep -q`：pipefail 下 grep -q 命中即提前退出，
+          # echo 收到 SIGPIPE(141) 会让整个管道判失败，明明资源在包里却误报缺失
+          grep -q 'assets/apps/__UNI__TIRE001/www/app-service.js' <<<"$listing" \
+            || { echo "::error::APK 缺少 uni-app 前端资源（assets/apps）" >&2; exit 1; }
+          grep -q 'assets/data/dcloud_properties.xml' <<<"$listing" \
+            || { echo "::error::APK 缺少 DCloud 运行时资源（assets/data）" >&2; exit 1; }
+          size=$(stat -c%s "$apk")
+          if [ "$size" -lt 2097152 ]; then
+            echo "::error::APK 仅 $size 字节，疑似空壳（正常应 > 50MB）" >&2
+            exit 1
+          fi
+          echo "完整性校验通过：APK $size 字节，含前端资源与 DCloud 运行时"
 
       - name: 输出构建摘要（供 release/records/ 记录使用）
         env:
